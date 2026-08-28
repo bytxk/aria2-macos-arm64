@@ -229,8 +229,8 @@ jobs:
           cd "$RUNNER_TEMP/aria2-deps"
 
           curl --fail --location --retry 5 --retry-delay 2 \
-            "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" \
-            -o gmp.tar.xz
+  "https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz" \
+  -o gmp.tar.xz
 
           echo "${GMP_SHA256}  gmp.tar.xz" | shasum -a 256 -c -
 
