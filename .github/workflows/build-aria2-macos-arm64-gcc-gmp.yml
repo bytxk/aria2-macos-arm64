@@ -1,0 +1,658 @@
+name: Build aria2 macOS ARM64 Static (Official + GCC GMP)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    name: macOS ARM64
+    runs-on: macos-14
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      PREFIX: ${{ github.workspace }}/_static
+
+      # Latest stable dependency versions as of 2026-08-29
+      ZLIB_VERSION: "1.3.2"
+      EXPAT_VERSION: "2.8.2"
+      CARES_VERSION: "1.34.8"
+      SQLITE_VERSION: "3530400"       # SQLite 3.53.4
+      GMP_VERSION: "6.3.0"
+      LIBGPG_ERROR_VERSION: "1.61"
+      LIBGCRYPT_VERSION: "1.12.3"
+      LIBSSH2_VERSION: "1.11.1"
+
+      # Integrity hashes
+      ZLIB_SHA256: "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+      EXPAT_SHA256: "ef7d1994f533c9e7343d6c19f31064fc8ebbcbcaa144be3812b4f43052a05f4c"
+      CARES_SHA256: "c222b6d681096f9444d2c4863d2c1174019e27cacca0a4a5c114d36dd7d7bf78"
+      SQLITE_SHA3_256: "454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338"
+      # GCC infrastructure SHA-512 for gmp-6.3.0.tar.bz2
+      GMP_SHA512: "3b684c9bcb9ede2b7e54d0ba4c9764bfa17c20d4f3000017c553b6f1e135b536949580ff37341680c25dc236cfe0ba1db8cfdfe619ce013656189ef0871b89f8"
+      LIBGPG_ERROR_SHA256: "7a85413f2bc354f4f8aa832b718af122e48965e9e0eb9012ee659c13c6385c93"
+      LIBGCRYPT_SHA256: "98d1b0b3202d2b03fa754a35aa3cbbfcf526a3260d8d2ee213748001b1043006"
+      LIBSSH2_SHA256: "d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7"
+
+    steps:
+      - name: Checkout aria2
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sw_vers
+          clang --version
+          test "$(uname -m)" = "arm64"
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Homebrew is used for build tools only.
+          brew install \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            gettext
+
+      - name: Prepare build environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p "$PREFIX"
+          mkdir -p "$RUNNER_TEMP/aria2-deps"
+
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+          echo "BASE_CFLAGS=-Os -arch arm64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}" >> "$GITHUB_ENV"
+          echo "BASE_CXXFLAGS=-Os -arch arm64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -stdlib=libc++ -std=c++11" >> "$GITHUB_ENV"
+          echo "BASE_LDFLAGS=-arch arm64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -Wl,-dead_strip" >> "$GITHUB_ENV"
+
+          echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" >> "$GITHUB_ENV"
+
+          # gettext is used only as a build-time tool.
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+
+      # ======================================================================
+      # Official project sources; GMP is fetched from GCC infrastructure.
+      #
+      # A preflight check runs before compilation so an inaccessible upstream
+      # fails early and names the exact dependency/source.
+      # ======================================================================
+      - name: Verify official source accessibility
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_url() {
+            local name="$1"
+            local url="$2"
+
+            echo "============================================================"
+            echo "Checking $name"
+            echo "$url"
+
+            # Request only the first byte. -L follows official redirects such
+            # as GitHub release-assets and GNU's mirror redirector.
+            if curl \
+              --fail \
+              --location \
+              --range 0-0 \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --retry 2 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --user-agent "aria2-static-github-actions" \
+              --output /dev/null \
+              "$url"; then
+              echo "OK: $name"
+            else
+              echo "ERROR: official source is not reachable: $name" >&2
+              echo "URL: $url" >&2
+              return 1
+            fi
+          }
+
+          check_url "zlib" \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+
+          check_url "Expat" \
+            "https://github.com/libexpat/libexpat/releases/download/R_2_8_2/expat-${EXPAT_VERSION}.tar.gz"
+
+          check_url "c-ares" \
+            "https://github.com/c-ares/c-ares/releases/download/v${CARES_VERSION}/c-ares-${CARES_VERSION}.tar.gz"
+
+          check_url "SQLite" \
+            "https://www.sqlite.org/2026/sqlite-autoconf-${SQLITE_VERSION}.tar.gz"
+
+          check_url "GMP" \
+            "https://gcc.gnu.org/pub/gcc/infrastructure/gmp-${GMP_VERSION}.tar.bz2"
+
+          check_url "libgpg-error" \
+            "https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-${LIBGPG_ERROR_VERSION}.tar.bz2"
+
+          check_url "libgcrypt" \
+            "https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-${LIBGCRYPT_VERSION}.tar.bz2"
+
+          check_url "libssh2" \
+            "https://github.com/libssh2/libssh2/releases/download/libssh2-${LIBSSH2_VERSION}/libssh2-${LIBSSH2_VERSION}.tar.gz"
+
+      - name: Create official-source download helper
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > "$RUNNER_TEMP/download-official.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          output="$1"
+          url="$2"
+
+          rm -f "$output" "$output.tmp"
+
+          echo "============================================================"
+          echo "Official source: $url"
+
+          curl \
+            --fail \
+            --location \
+            --connect-timeout 20 \
+            --max-time 300 \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --user-agent "aria2-static-github-actions" \
+            "$url" \
+            -o "$output.tmp"
+
+          mv "$output.tmp" "$output"
+          echo "Downloaded: $output"
+          SH
+
+          chmod +x "$RUNNER_TEMP/download-official.sh"
+
+      # ======================================================================
+      # zlib 1.3.2
+      # ======================================================================
+      - name: Build zlib
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" zlib.tar.gz \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+
+          echo "${ZLIB_SHA256}  zlib.tar.gz" | shasum -a 256 -c -
+
+          tar -xzf zlib.tar.gz
+          cd "zlib-${ZLIB_VERSION}"
+
+          CFLAGS="$BASE_CFLAGS" \
+            ./configure \
+              --static \
+              --prefix="$PREFIX"
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      # ======================================================================
+      # Expat 2.8.2
+      # ======================================================================
+      - name: Build Expat
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" expat.tar.gz \
+            "https://github.com/libexpat/libexpat/releases/download/R_2_8_2/expat-${EXPAT_VERSION}.tar.gz"
+
+          echo "${EXPAT_SHA256}  expat.tar.gz" | shasum -a 256 -c -
+
+          tar -xzf expat.tar.gz
+          mkdir expat-build
+          cd expat-build
+
+          CFLAGS="$BASE_CFLAGS" \
+          LDFLAGS="$BASE_LDFLAGS" \
+            "../expat-${EXPAT_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared \
+              --without-docbook
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      # ======================================================================
+      # c-ares 1.34.8
+      # ======================================================================
+      - name: Build c-ares
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" cares.tar.gz \
+            "https://github.com/c-ares/c-ares/releases/download/v${CARES_VERSION}/c-ares-${CARES_VERSION}.tar.gz"
+
+          echo "${CARES_SHA256}  cares.tar.gz" | shasum -a 256 -c -
+
+          tar -xzf cares.tar.gz
+          mkdir cares-build
+          cd cares-build
+
+          CFLAGS="$BASE_CFLAGS" \
+          LDFLAGS="$BASE_LDFLAGS" \
+            "../c-ares-${CARES_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared \
+              --disable-tests
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+
+      # ======================================================================
+      # SQLite 3.53.4
+      #
+      # SQLite publishes SHA3-256 for its release archive, so verify with
+      # Python's hashlib rather than pretending it is SHA-256.
+      # ======================================================================
+      - name: Build SQLite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" sqlite.tar.gz \
+            "https://www.sqlite.org/2026/sqlite-autoconf-${SQLITE_VERSION}.tar.gz"
+
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          expected = os.environ["SQLITE_SHA3_256"].lower()
+          actual = hashlib.sha3_256(Path("sqlite.tar.gz").read_bytes()).hexdigest()
+
+          print("SQLite SHA3-256:", actual)
+          if actual != expected:
+              raise SystemExit(
+                  f"SQLite checksum mismatch: expected {expected}, got {actual}"
+              )
+          PY
+
+          tar -xzf sqlite.tar.gz
+          mkdir sqlite-build
+          cd sqlite-build
+
+          CFLAGS="$BASE_CFLAGS" \
+          LDFLAGS="$BASE_LDFLAGS" \
+            "../sqlite-autoconf-${SQLITE_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+
+      # ======================================================================
+      # GMP 6.3.0 - GCC infrastructure hosted source
+      # ======================================================================
+      - name: Build GMP
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" gmp.tar.bz2 \
+            "https://gcc.gnu.org/pub/gcc/infrastructure/gmp-${GMP_VERSION}.tar.bz2"
+
+          echo "${GMP_SHA512}  gmp.tar.bz2" | shasum -a 512 -c -
+
+          tar -xjf gmp.tar.bz2
+          mkdir gmp-build
+          cd gmp-build
+
+          CFLAGS="$BASE_CFLAGS" \
+          CXXFLAGS="$BASE_CXXFLAGS" \
+          LDFLAGS="$BASE_LDFLAGS" \
+            "../gmp-${GMP_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared \
+              --disable-cxx \
+              --with-pic
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      # ======================================================================
+      # libgpg-error 1.61 - official GnuPG release archive
+      # ======================================================================
+      - name: Build libgpg-error
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" libgpg-error.tar.bz2 \
+            "https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-${LIBGPG_ERROR_VERSION}.tar.bz2"
+
+          echo "${LIBGPG_ERROR_SHA256}  libgpg-error.tar.bz2" | shasum -a 256 -c -
+
+          tar -xjf libgpg-error.tar.bz2
+          mkdir libgpg-error-build
+          cd libgpg-error-build
+
+          CFLAGS="$BASE_CFLAGS" \
+          LDFLAGS="$BASE_LDFLAGS" \
+            "../libgpg-error-${LIBGPG_ERROR_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared \
+              --with-pic \
+              --disable-nls \
+              --disable-doc
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+          test -x "$PREFIX/bin/gpgrt-config"
+          "$PREFIX/bin/gpgrt-config" --version
+
+      # ======================================================================
+      # libgcrypt 1.12.3 - official GnuPG release archive
+      # ======================================================================
+      - name: Build libgcrypt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" libgcrypt.tar.bz2 \
+            "https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-${LIBGCRYPT_VERSION}.tar.bz2"
+
+          echo "${LIBGCRYPT_SHA256}  libgcrypt.tar.bz2" | shasum -a 256 -c -
+
+          tar -xjf libgcrypt.tar.bz2
+          mkdir libgcrypt-build
+          cd libgcrypt-build
+
+          CFLAGS="$BASE_CFLAGS" \
+          CXXFLAGS="$BASE_CXXFLAGS" \
+          LDFLAGS="$BASE_LDFLAGS" \
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" \
+          GPGRT_CONFIG="$PREFIX/bin/gpgrt-config" \
+            "../libgcrypt-${LIBGCRYPT_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared \
+              --with-libgpg-error-prefix="$PREFIX"
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      # ======================================================================
+      # libssh2 1.11.1 + libgcrypt backend
+      # ======================================================================
+      - name: Build libssh2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/aria2-deps"
+
+          "$RUNNER_TEMP/download-official.sh" libssh2.tar.gz \
+            "https://github.com/libssh2/libssh2/releases/download/libssh2-${LIBSSH2_VERSION}/libssh2-${LIBSSH2_VERSION}.tar.gz"
+
+          echo "${LIBSSH2_SHA256}  libssh2.tar.gz" | shasum -a 256 -c -
+
+          tar -xzf libssh2.tar.gz
+          mkdir libssh2-build
+          cd libssh2-build
+
+          CFLAGS="$BASE_CFLAGS -I$PREFIX/include" \
+          LDFLAGS="$BASE_LDFLAGS -L$PREFIX/lib" \
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" \
+            "../libssh2-${LIBSSH2_VERSION}/configure" \
+              --prefix="$PREFIX" \
+              --enable-static \
+              --disable-shared \
+              --with-pic \
+              --with-crypto=libgcrypt \
+              --with-libgcrypt-prefix="$PREFIX"
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+
+      # ======================================================================
+      # Sanity-check the static dependency prefix before building aria2.
+      # ======================================================================
+      - name: Verify static dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== Static libraries ====="
+          find "$PREFIX/lib" -maxdepth 1 -name '*.a' -print | sort
+
+          test -f "$PREFIX/lib/libz.a"
+          test -f "$PREFIX/lib/libexpat.a"
+          test -f "$PREFIX/lib/libcares.a"
+          test -f "$PREFIX/lib/libsqlite3.a"
+          test -f "$PREFIX/lib/libgmp.a"
+          test -f "$PREFIX/lib/libgpg-error.a"
+          test -f "$PREFIX/lib/libgcrypt.a"
+          test -f "$PREFIX/lib/libssh2.a"
+
+          echo
+          echo "===== Unexpected dylibs ====="
+          find "$PREFIX" -name '*.dylib' -print || true
+
+          if find "$PREFIX" -name '*.dylib' -print -quit | grep -q .; then
+            echo "ERROR: shared dependency was unexpectedly installed."
+            exit 1
+          fi
+
+      # ======================================================================
+      # aria2
+      # ======================================================================
+      - name: Generate aria2 configure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          autoreconf -i
+
+      - name: Configure aria2
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf build-arm64
+          mkdir build-arm64
+          cd build-arm64
+
+          CFLAGS="$BASE_CFLAGS -I$PREFIX/include" \
+          CXXFLAGS="$BASE_CXXFLAGS -I$PREFIX/include" \
+          LDFLAGS="$BASE_LDFLAGS -L$PREFIX/lib" \
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" \
+            ../configure \
+              --prefix="$GITHUB_WORKSPACE/dist" \
+              --sysconfdir=/etc \
+              --enable-static \
+              --disable-shared \
+              --enable-metalink \
+              --enable-bittorrent \
+              --disable-nls \
+              --with-appletls \
+              --with-libgmp \
+              --with-sqlite3 \
+              --with-libz \
+              --with-libexpat \
+              --with-libcares \
+              --with-libgcrypt \
+              --with-libssh2 \
+              --without-libuv \
+              --without-gnutls \
+              --without-openssl \
+              --without-libnettle \
+              --without-libxml2 \
+              ARIA2_STATIC=yes
+
+      - name: Build aria2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd build-arm64
+
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install-strip
+
+      # ======================================================================
+      # Final verification
+      # ======================================================================
+      - name: Verify aria2 binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          BIN="$GITHUB_WORKSPACE/dist/bin/aria2c"
+
+          echo "===== Architecture ====="
+          file "$BIN"
+          lipo -archs "$BIN"
+          test "$(lipo -archs "$BIN")" = "arm64"
+
+          echo
+          echo "===== Version / features ====="
+          "$BIN" --version
+
+          echo
+          echo "===== Dynamic dependencies ====="
+          otool -L "$BIN"
+
+          echo
+          echo "===== PIE ====="
+          otool -hv "$BIN" | grep PIE
+
+          echo
+          echo "===== Homebrew runtime dependency check ====="
+          if otool -L "$BIN" | grep -E '/opt/homebrew|/usr/local/Cellar|/usr/local/opt'; then
+            echo "ERROR: Homebrew runtime dependency detected."
+            exit 1
+          fi
+
+          echo "OK: no Homebrew runtime dependencies."
+
+          echo
+          echo "===== Expected feature check ====="
+          FEATURES="$("$BIN" --version | sed -n '/Enabled Features:/,$p')"
+
+          for feature in \
+            "Async DNS" \
+            "BitTorrent" \
+            "Firefox3 Cookie" \
+            "GZip" \
+            "HTTPS" \
+            "Message Digest" \
+            "Metalink" \
+            "XML-RPC" \
+            "SFTP"
+          do
+            echo "$FEATURES" | grep -Fq "$feature" || {
+              echo "ERROR: missing expected feature: $feature"
+              exit 1
+            }
+          done
+
+      # ======================================================================
+      # Package
+      # ======================================================================
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          BIN="$GITHUB_WORKSPACE/dist/bin/aria2c"
+          VERSION="$("$BIN" --version | head -n1 | awk '{print $3}')"
+          PACKAGE="aria2-${VERSION}-macos-arm64"
+
+          rm -rf package artifact
+          mkdir -p "package/$PACKAGE" artifact
+
+          cp "$BIN" "package/$PACKAGE/aria2c"
+          cp COPYING "package/$PACKAGE/LICENSE" || true
+
+          {
+            echo "aria2 ${VERSION} for macOS Apple Silicon"
+            echo
+            echo "Architecture: arm64"
+            echo "Minimum deployment target: macOS ${MACOSX_DEPLOYMENT_TARGET}"
+            echo "Runtime Homebrew dependency: none"
+            echo
+            echo "Bundled static dependencies:"
+            echo "  zlib ${ZLIB_VERSION}"
+            echo "  Expat ${EXPAT_VERSION}"
+            echo "  c-ares ${CARES_VERSION}"
+            echo "  SQLite 3.53.4"
+            echo "  GMP ${GMP_VERSION}"
+            echo "  libgpg-error ${LIBGPG_ERROR_VERSION}"
+            echo "  libgcrypt ${LIBGCRYPT_VERSION}"
+            echo "  libssh2 ${LIBSSH2_VERSION}"
+            echo
+            echo "aria2 feature report:"
+            "$BIN" --version
+          } > "package/$PACKAGE/BUILD-INFO.txt"
+
+          tar -C package \
+            -czf "artifact/${PACKAGE}.tar.gz" \
+            "$PACKAGE"
+
+          shasum -a 256 "artifact/${PACKAGE}.tar.gz" \
+            > "artifact/${PACKAGE}.tar.gz.sha256"
+
+          echo "PACKAGE=$PACKAGE" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: |
+            artifact/*.tar.gz
+            artifact/*.sha256
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifact/*.tar.gz
+            artifact/*.sha256
