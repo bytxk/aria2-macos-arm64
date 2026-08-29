@@ -1,0 +1,446 @@
+name: Build aria2 macOS ARM64 (Auto Latest Dependencies)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    name: macOS ARM64
+    runs-on: macos-14
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      PREFIX: ${{ github.workspace }}/_static
+      DEPS_DIR: ${{ runner.temp }}/aria2-deps
+
+    steps:
+      - name: Checkout aria2
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sw_vers
+          clang --version
+          test "$(uname -m)" = "arm64"
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          brew install autoconf automake libtool pkg-config gettext
+
+      - name: Prepare build environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$PREFIX" "$DEPS_DIR"
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+          echo "BASE_CFLAGS=-Os -arch arm64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}" >> "$GITHUB_ENV"
+          echo "BASE_CXXFLAGS=-Os -arch arm64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -stdlib=libc++ -std=c++11" >> "$GITHUB_ENV"
+          echo "BASE_LDFLAGS=-arch arm64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -Wl,-dead_strip" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve latest stable dependency versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          from pathlib import Path
+
+          token = os.environ.get("GH_TOKEN", "")
+
+          def fetch(url, accept=None):
+              headers = {"User-Agent": "aria2-macos-static-builder/1.0"}
+              if accept:
+                  headers["Accept"] = accept
+              if token and "api.github.com" in url:
+                  headers["Authorization"] = f"Bearer {token}"
+                  headers["X-GitHub-Api-Version"] = "2022-11-28"
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read().decode("utf-8", errors="replace")
+
+          def fetch_json(url):
+              return json.loads(fetch(url, "application/vnd.github+json"))
+
+          def vtuple(v):
+              return tuple(int(x) for x in re.findall(r"\d+", v))
+
+          def github_asset(repo, regex):
+              rel = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest")
+              rx = re.compile(regex)
+              assets = [a for a in rel.get("assets", []) if rx.fullmatch(a.get("name", ""))]
+              if not assets:
+                  raise RuntimeError(f"{repo}: no matching source archive")
+              def rank(a):
+                  n = a["name"]
+                  return 0 if n.endswith(".tar.xz") else 1 if n.endswith(".tar.bz2") else 2
+              a = sorted(assets, key=rank)[0]
+              digest = a.get("digest") or ""
+              sha256 = digest.split(":",1)[1] if digest.startswith("sha256:") else ""
+              return a["name"], a["browser_download_url"], sha256
+
+          deps = {}
+
+          name, url, sha = github_asset("madler/zlib", r"zlib-(\d+\.\d+\.\d+)\.tar\.(?:xz|bz2|gz)")
+          ver = re.search(r"zlib-(\d+\.\d+\.\d+)", name).group(1)
+          deps["zlib"] = {"version": ver, "filename": name, "url": url, "sha256": sha}
+
+          name, url, sha = github_asset("libexpat/libexpat", r"expat-(\d+\.\d+\.\d+)\.tar\.(?:xz|bz2|gz)")
+          ver = re.search(r"expat-(\d+\.\d+\.\d+)", name).group(1)
+          deps["expat"] = {"version": ver, "filename": name, "url": url, "sha256": sha}
+
+          name, url, sha = github_asset("c-ares/c-ares", r"c-ares-(\d+\.\d+\.\d+)\.tar\.(?:xz|bz2|gz)")
+          ver = re.search(r"c-ares-(\d+\.\d+\.\d+)", name).group(1)
+          deps["cares"] = {"version": ver, "filename": name, "url": url, "sha256": sha}
+
+          name, url, sha = github_asset("libssh2/libssh2", r"libssh2-(\d+\.\d+\.\d+)\.tar\.(?:xz|bz2|gz)")
+          ver = re.search(r"libssh2-(\d+\.\d+\.\d+)", name).group(1)
+          deps["libssh2"] = {"version": ver, "filename": name, "url": url, "sha256": sha}
+
+          html = fetch("https://www.sqlite.org/download.html")
+          matches = re.findall(r"(?:(\d{4})/)?(sqlite-autoconf-(\d+)\.tar\.gz)", html)
+          if not matches:
+              raise RuntimeError("Cannot resolve SQLite")
+          year, filename, num = max(matches, key=lambda x: int(x[2]))
+          n = int(num)
+          version = f"{n//1000000}.{(n//10000)%100}.{(n//100)%100}"
+          url = f"https://www.sqlite.org/{year}/{filename}" if year else f"https://www.sqlite.org/{filename}"
+          deps["sqlite"] = {"version": version, "numeric_version": num, "filename": filename, "url": url}
+
+          base = "https://gcc.gnu.org/pub/gcc/infrastructure/"
+          html = fetch(base)
+          g = re.findall(r'href=["\'](gmp-(\d+\.\d+\.\d+)\.tar\.(xz|bz2|gz))["\']', html)
+          if not g:
+              raise RuntimeError("Cannot resolve GMP")
+          top = max({x[1] for x in g}, key=vtuple)
+          same = [x for x in g if x[1] == top]
+          order = {"xz":0,"bz2":1,"gz":2}
+          filename, version, _ = sorted(same, key=lambda x: order[x[2]])[0]
+          deps["gmp"] = {"version": version, "filename": filename, "url": base + filename}
+
+          def gnupg_pkg(pkg):
+              base = f"https://gnupg.org/ftp/gcrypt/{pkg}/"
+              html = fetch(base)
+              xs = re.findall(rf'href=["\']({re.escape(pkg)}-(\d+\.\d+(?:\.\d+)?)\.tar\.(xz|bz2|gz))["\']', html)
+              if not xs:
+                  raise RuntimeError(f"Cannot resolve {pkg}")
+              top = max({x[1] for x in xs}, key=vtuple)
+              same = [x for x in xs if x[1] == top]
+              order = {"xz":0,"bz2":1,"gz":2}
+              filename, version, _ = sorted(same, key=lambda x: order[x[2]])[0]
+              return {"version": version, "filename": filename, "url": base + filename}
+
+          deps["libgpg_error"] = gnupg_pkg("libgpg-error")
+          deps["libgcrypt"] = gnupg_pkg("libgcrypt")
+
+          Path("resolved-dependencies.json").write_text(json.dumps(deps, indent=2, sort_keys=True)+"\n")
+
+          env = {
+              "ZLIB_VERSION":deps["zlib"]["version"], "ZLIB_FILE":deps["zlib"]["filename"], "ZLIB_URL":deps["zlib"]["url"], "ZLIB_SHA256":deps["zlib"].get("sha256", ""),
+              "EXPAT_VERSION":deps["expat"]["version"], "EXPAT_FILE":deps["expat"]["filename"], "EXPAT_URL":deps["expat"]["url"], "EXPAT_SHA256":deps["expat"].get("sha256", ""),
+              "CARES_VERSION":deps["cares"]["version"], "CARES_FILE":deps["cares"]["filename"], "CARES_URL":deps["cares"]["url"], "CARES_SHA256":deps["cares"].get("sha256", ""),
+              "SQLITE_VERSION":deps["sqlite"]["version"], "SQLITE_NUMERIC_VERSION":deps["sqlite"]["numeric_version"], "SQLITE_FILE":deps["sqlite"]["filename"], "SQLITE_URL":deps["sqlite"]["url"],
+              "GMP_VERSION":deps["gmp"]["version"], "GMP_FILE":deps["gmp"]["filename"], "GMP_URL":deps["gmp"]["url"],
+              "LIBGPG_ERROR_VERSION":deps["libgpg_error"]["version"], "LIBGPG_ERROR_FILE":deps["libgpg_error"]["filename"], "LIBGPG_ERROR_URL":deps["libgpg_error"]["url"],
+              "LIBGCRYPT_VERSION":deps["libgcrypt"]["version"], "LIBGCRYPT_FILE":deps["libgcrypt"]["filename"], "LIBGCRYPT_URL":deps["libgcrypt"]["url"],
+              "LIBSSH2_VERSION":deps["libssh2"]["version"], "LIBSSH2_FILE":deps["libssh2"]["filename"], "LIBSSH2_URL":deps["libssh2"]["url"], "LIBSSH2_SHA256":deps["libssh2"].get("sha256", "")
+          }
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              for k,v in env.items(): f.write(f"{k}={v}\n")
+
+          print(json.dumps(deps, indent=2))
+          PY
+
+      - name: Create download helper
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/download-source.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          url="$1"; output="$2"; expected="${3:-}"
+          curl --fail --location --connect-timeout 20 --max-time 300 --retry 5 --retry-all-errors --retry-delay 2 "$url" -o "$output"
+          actual="$(shasum -a 256 "$output" | awk '{print $1}')"
+          if [[ -n "$expected" && "$actual" != "$expected" ]]; then
+            echo "SHA-256 mismatch for $output"; exit 1
+          fi
+          echo "SHA-256: $actual"
+          SH
+          chmod +x "$RUNNER_TEMP/download-source.sh"
+
+      - name: Build zlib
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$ZLIB_URL" "$ZLIB_FILE" "$ZLIB_SHA256"
+          tar -xf "$ZLIB_FILE"
+          cd "zlib-${ZLIB_VERSION}"
+          CFLAGS="$BASE_CFLAGS" ./configure --static --prefix="$PREFIX"
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      - name: Build Expat
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$EXPAT_URL" "$EXPAT_FILE" "$EXPAT_SHA256"
+          tar -xf "$EXPAT_FILE"
+          mkdir -p expat-build && cd expat-build
+          CFLAGS="$BASE_CFLAGS" LDFLAGS="$BASE_LDFLAGS" ../expat-${EXPAT_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared --without-docbook
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      - name: Build c-ares
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$CARES_URL" "$CARES_FILE" "$CARES_SHA256"
+          tar -xf "$CARES_FILE"
+          mkdir -p cares-build && cd cares-build
+          CFLAGS="$BASE_CFLAGS" LDFLAGS="$BASE_LDFLAGS" ../c-ares-${CARES_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared --disable-tests
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+
+      - name: Build SQLite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$SQLITE_URL" "$SQLITE_FILE"
+          tar -xf "$SQLITE_FILE"
+          mkdir -p sqlite-build && cd sqlite-build
+          CFLAGS="$BASE_CFLAGS" LDFLAGS="$BASE_LDFLAGS" ../sqlite-autoconf-${SQLITE_NUMERIC_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+
+      - name: Build GMP
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$GMP_URL" "$GMP_FILE"
+          tar -xf "$GMP_FILE"
+          mkdir -p gmp-build && cd gmp-build
+          CFLAGS="$BASE_CFLAGS" CXXFLAGS="$BASE_CXXFLAGS" LDFLAGS="$BASE_LDFLAGS" ../gmp-${GMP_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared --disable-cxx --with-pic
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      - name: Build libgpg-error
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$LIBGPG_ERROR_URL" "$LIBGPG_ERROR_FILE"
+          tar -xf "$LIBGPG_ERROR_FILE"
+          mkdir -p libgpg-error-build && cd libgpg-error-build
+          CFLAGS="$BASE_CFLAGS" LDFLAGS="$BASE_LDFLAGS" ../libgpg-error-${LIBGPG_ERROR_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared --with-pic --disable-nls --disable-doc
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      - name: Build libgcrypt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$LIBGCRYPT_URL" "$LIBGCRYPT_FILE"
+          tar -xf "$LIBGCRYPT_FILE"
+          mkdir -p libgcrypt-build && cd libgcrypt-build
+          CFLAGS="$BASE_CFLAGS" CXXFLAGS="$BASE_CXXFLAGS" LDFLAGS="$BASE_LDFLAGS" GPGRT_CONFIG="$PREFIX/bin/gpgrt-config" ../libgcrypt-${LIBGCRYPT_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared --with-libgpg-error-prefix="$PREFIX"
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install
+
+      - name: Build libssh2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$DEPS_DIR"
+          "$RUNNER_TEMP/download-source.sh" "$LIBSSH2_URL" "$LIBSSH2_FILE" "$LIBSSH2_SHA256"
+          tar -xf "$LIBSSH2_FILE"
+          mkdir -p libssh2-build && cd libssh2-build
+          CFLAGS="$BASE_CFLAGS -I$PREFIX/include" LDFLAGS="$BASE_LDFLAGS -L$PREFIX/lib" PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" ../libssh2-${LIBSSH2_VERSION}/configure --prefix="$PREFIX" --enable-static --disable-shared --with-pic --with-crypto=libgcrypt --with-libgcrypt-prefix="$PREFIX"
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+
+      - name: Verify static dependency prefix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "$PREFIX/lib/libz.a"
+          test -f "$PREFIX/lib/libexpat.a"
+          test -f "$PREFIX/lib/libcares.a"
+          test -f "$PREFIX/lib/libsqlite3.a"
+          test -f "$PREFIX/lib/libgmp.a"
+          test -f "$PREFIX/lib/libgpg-error.a"
+          test -f "$PREFIX/lib/libgcrypt.a"
+          test -f "$PREFIX/lib/libssh2.a"
+          if find "$PREFIX" -name '*.dylib' -print -quit | grep -q .; then
+            echo "Unexpected third-party dylib detected"; exit 1
+          fi
+
+      - name: Generate aria2 configure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          autoreconf -i
+
+      - name: Configure aria2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf build-arm64 && mkdir build-arm64 && cd build-arm64
+          CFLAGS="$BASE_CFLAGS -I$PREFIX/include" \
+          CXXFLAGS="$BASE_CXXFLAGS -I$PREFIX/include" \
+          LDFLAGS="$BASE_LDFLAGS -L$PREFIX/lib" \
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" \
+          ../configure \
+            --prefix="$GITHUB_WORKSPACE/dist" \
+            --sysconfdir=/etc \
+            --enable-static \
+            --disable-shared \
+            --enable-metalink \
+            --enable-bittorrent \
+            --disable-nls \
+            --with-appletls \
+            --with-libgmp \
+            --with-sqlite3 \
+            --with-libz \
+            --with-libexpat \
+            --with-libcares \
+            --with-libgcrypt \
+            --with-libssh2 \
+            --without-libuv \
+            --without-gnutls \
+            --without-openssl \
+            --without-libnettle \
+            --without-libxml2 \
+            ARIA2_STATIC=yes
+
+      - name: Build aria2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd build-arm64
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make check
+          make install-strip
+
+      - name: Verify aria2 binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN="$GITHUB_WORKSPACE/dist/bin/aria2c"
+          file "$BIN"
+          lipo -archs "$BIN"
+          test "$(lipo -archs "$BIN")" = "arm64"
+          "$BIN" --version
+          otool -L "$BIN"
+          otool -hv "$BIN" | grep PIE
+          if otool -L "$BIN" | grep -E '/opt/homebrew|/usr/local/Cellar|/usr/local/opt'; then
+            echo "Homebrew runtime dependency detected"; exit 1
+          fi
+          FEATURES="$("$BIN" --version | sed -n '/Enabled Features:/,$p')"
+          for feature in "Async DNS" "BitTorrent" "Firefox3 Cookie" "GZip" "HTTPS" "Message Digest" "Metalink" "XML-RPC" "SFTP"; do
+            echo "$FEATURES" | grep -Fq "$feature" || { echo "Missing feature: $feature"; exit 1; }
+          done
+
+      - name: Record dependency checksums
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          p = Path("resolved-dependencies.json")
+          d = json.loads(p.read_text())
+          files = {
+            "zlib": os.environ["ZLIB_FILE"], "expat": os.environ["EXPAT_FILE"], "cares": os.environ["CARES_FILE"],
+            "sqlite": os.environ["SQLITE_FILE"], "gmp": os.environ["GMP_FILE"], "libgpg_error": os.environ["LIBGPG_ERROR_FILE"],
+            "libgcrypt": os.environ["LIBGCRYPT_FILE"], "libssh2": os.environ["LIBSSH2_FILE"]
+          }
+          depdir = Path(os.environ["DEPS_DIR"])
+          for k,f in files.items():
+              fp = depdir / f
+              if fp.exists(): d[k]["downloaded_sha256"] = hashlib.sha256(fp.read_bytes()).hexdigest()
+          p.write_text(json.dumps(d, indent=2, sort_keys=True)+"\n")
+          PY
+          cat resolved-dependencies.json
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN="$GITHUB_WORKSPACE/dist/bin/aria2c"
+          VERSION="$("$BIN" --version | head -n1 | awk '{print $3}')"
+          PACKAGE="aria2-${VERSION}-macos-arm64"
+          rm -rf package artifact
+          mkdir -p "package/$PACKAGE" artifact
+          cp "$BIN" "package/$PACKAGE/aria2c"
+          cp COPYING "package/$PACKAGE/LICENSE" || true
+          cp resolved-dependencies.json "package/$PACKAGE/RESOLVED-DEPENDENCIES.json"
+          {
+            echo "aria2 ${VERSION} for macOS Apple Silicon"
+            echo "Architecture: arm64"
+            echo "Minimum deployment target: macOS ${MACOSX_DEPLOYMENT_TARGET}"
+            echo "Runtime Homebrew dependency: none"
+            echo
+            echo "Resolved dependencies:"
+            echo "  zlib ${ZLIB_VERSION}"
+            echo "  Expat ${EXPAT_VERSION}"
+            echo "  c-ares ${CARES_VERSION}"
+            echo "  SQLite ${SQLITE_VERSION}"
+            echo "  GMP ${GMP_VERSION}"
+            echo "  libgpg-error ${LIBGPG_ERROR_VERSION}"
+            echo "  libgcrypt ${LIBGCRYPT_VERSION}"
+            echo "  libssh2 ${LIBSSH2_VERSION}"
+            echo
+            "$BIN" --version
+          } > "package/$PACKAGE/BUILD-INFO.txt"
+          tar -C package -czf "artifact/${PACKAGE}.tar.gz" "$PACKAGE"
+          shasum -a 256 "artifact/${PACKAGE}.tar.gz" > "artifact/${PACKAGE}.tar.gz.sha256"
+          cp resolved-dependencies.json artifact/
+          echo "PACKAGE=$PACKAGE" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: |
+            artifact/*.tar.gz
+            artifact/*.sha256
+            artifact/resolved-dependencies.json
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifact/*.tar.gz
+            artifact/*.sha256
+            artifact/resolved-dependencies.json
